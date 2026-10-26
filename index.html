@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Авионика Сердца</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #05070f;
+    font-family: 'Courier New', monospace;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  #scene { display: block; position: absolute; inset: 0; }
+  .hud {
+    position: absolute; z-index: 3;
+    color: #4ff0ff; font-size: 12px;
+    letter-spacing: 2px;
+    text-shadow: 0 0 8px #0af;
+    opacity: 0.75; pointer-events: none;
+    text-transform: uppercase; line-height: 1.6;
+  }
+  #hud-tl { top: 16px; left: 20px; }
+  #hud-tr { top: 16px; right: 20px; text-align: right; }
+  #hud-bl { bottom: 16px; left: 20px; }
+  #hud-br { bottom: 16px; right: 20px; text-align: right; }
+  .blink { animation: blink 1.2s infinite; }
+  @keyframes blink { 50% { opacity: 0.2; } }
+  #hint {
+    position: absolute; bottom: 56px; left: 50%;
+    transform: translateX(-50%);
+    color: #4ff0ff; opacity: 0.48;
+    font-size: 11px; letter-spacing: 2px;
+    text-shadow: 0 0 6px #0af;
+    pointer-events: none; text-transform: uppercase;
+    text-align: center; z-index: 3;
+    max-width: 92vw; line-height: 1.7;
+    white-space: nowrap;
+  }
+  #hint .sep { opacity: 0.5; margin: 0 4px; }
+  @media (max-width: 640px) {
+    #hint { font-size: 9px; letter-spacing: 1px; bottom: 52px; }
+  }
+  #toast {
+    position: absolute; top: 42%; left: 50%;
+    transform: translate(-50%, -50%);
+    color: #4ff0ff; font-size: 20px;
+    letter-spacing: 3px;
+    text-shadow: 0 0 22px currentColor;
+    pointer-events: none; text-transform: uppercase;
+    opacity: 0; transition: opacity 0.4s;
+    z-index: 4; font-weight: bold;
+    white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div class="hud" id="hud-tl">✈ АВИОНИКА<br>СТАТУС: <span id="status">ОНЛАЙН</span></div>
+<div class="hud" id="hud-tr">СВЯЗЬ.СЕРДЦЕ <span class="blink">●</span><br>ЗАГРУЗКА: 100%</div>
+<div class="hud" id="hud-bl">СИГНАЛ: ▲▲▲▲▁<br>ВЫСОТА: 11480 м</div>
+<div class="hud" id="hud-br">ТЕМП. ЯДРА: 36.6°C<br>♥ ЛЮБОВЬ.ОС v2.6</div>
+<div id="hint">
+  КЛИК ♥ — ОРБИТА<span class="sep">·</span>КЛИК ✈ — УСКОРЕНИЕ<br>
+  КЛИК ПО ЭКРАНУ — ФЕЙЕРВЕРК + КУРС<br>
+  КЛИК ПО ЧИПУ — ПИТАНИЕ И КУРС
+</div>
+<div id="toast"></div>
+
+<script>
+(() => {
+  const scene = document.getElementById('scene');
+  const ctx = scene.getContext('2d', { alpha: false });
+  const toastEl = document.getElementById('toast');
+  const statusEl = document.getElementById('status');
+
+  const IS_MOBILE = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+                 || (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+
+  let W = 0, H = 0, DPR = 1, t = 0, lastTime = 0;
+
+  let backgroundLayer = null;
+  let heartLayer = null;
+  let heartDrawSize = 0;
+
+  const particleSprites = [];
+  const sparks = [];
+  const chipsList = [];
+  const chipPulses = new Map();
+
+  const plane = {
+    x: 0, y: 0, angle: 0,
+    waypoints: [],
+    chaseTime: 0,
+    trail: [],
+    boost: 0,
+    initialized: false,
+  };
+
+  let heartPulse = 0;
+  let fwTimer = 0.6;
+  let statusResetTimer = 0;
+
+  // --- Состояние орбиты ---
+  let orbitPhase = 'none'; // 'none' | 'approach' | 'transition' | 'orbit'
+  let orbitStartTime = 0;
+  let orbitStartAngle = 0;
+  let orbitTransStartTime = 0;
+  let orbitTransStartX = 0;
+  let orbitTransStartY = 0;
+  let orbitTransStartAngle = 0;
+  let orbitTransTargetAngle = 0;
+  const ORBIT_TRANS_DURATION = 0.55;
+
+  function heartPoint(a) {
+    const x = 16 * Math.pow(Math.sin(a), 3);
+    const y = -(13 * Math.cos(a) - 5 * Math.cos(2*a) - 2 * Math.cos(3*a) - Math.cos(4*a));
+    return { x, y };
+  }
+
+  function showToast(text, color) {
+    toastEl.textContent = text;
+    toastEl.style.color = color || '#4ff0ff';
+    toastEl.style.opacity = 1;
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(() => { toastEl.style.opacity = 0; }, 1100);
+  }
+
+  function buildParticleSprites() {
+    particleSprites.length = 0;
+    const size = 32;
+    for (let i = 0; i < 12; i++) {
+      const hue = i * 30;
+      const c = document.createElement('canvas');
+      c.width = c.height = size;
+      const pc = c.getContext('2d');
+      const g = pc.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+      g.addColorStop(0, `hsla(${hue},100%,92%,1)`);
+      g.addColorStop(0.25, `hsla(${hue},100%,72%,0.85)`);
+      g.addColorStop(0.55, `hsla(${hue},100%,55%,0.25)`);
+      g.addColorStop(1, `hsla(${hue},100%,50%,0)`);
+      pc.fillStyle = g;
+      pc.fillRect(0, 0, size, size);
+      particleSprites.push(c);
+    }
+  }
+
+  function spriteForHue(hue) {
+    let idx = Math.round(hue / 30) % 12;
+    if (idx < 0) idx += 12;
+    return particleSprites[idx];
+  }
+
+  function renderChip(c, cctx) {
+    const s = c.size, a = c.alpha;
+    cctx.save();
+    cctx.translate(c.x0, c.y0);
+    cctx.rotate(c.rot);
+
+    cctx.fillStyle = `hsla(${c.hue}, 80%, 50%, ${a * 0.55})`;
+    cctx.strokeStyle = `hsla(${c.hue}, 100%, 65%, ${a + 0.15})`;
+    cctx.lineWidth = 1;
+    cctx.beginPath();
+    cctx.rect(-s/2, -s/2, s, s);
+    cctx.fill();
+    cctx.stroke();
+
+    cctx.strokeStyle = `hsla(${c.hue}, 100%, 70%, ${a + 0.1})`;
+    const pinLen = s * 0.18;
+    const n = c.pins;
+    cctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const off = -s/2 + (i + 0.5) * (s / n);
+      cctx.moveTo(off, -s/2); cctx.lineTo(off, -s/2 - pinLen);
+      cctx.moveTo(off, s/2); cctx.lineTo(off, s/2 + pinLen);
+      cctx.moveTo(-s/2, off); cctx.lineTo(-s/2 - pinLen, off);
+      cctx.moveTo(s/2, off); cctx.lineTo(s/2 + pinLen, off);
+    }
+    cctx.stroke();
+
+    cctx.fillStyle = `hsla(${c.hue}, 100%, 80%, ${a + 0.2})`;
+    cctx.beginPath();
+    cctx.arc(-s*0.3, -s*0.3, s*0.06, 0, Math.PI*2);
+    cctx.fill();
+
+    cctx.strokeStyle = `hsla(${c.hue}, 100%, 75%, ${a + 0.08})`;
+    cctx.lineWidth = 0.5;
+    cctx.beginPath();
+    for (let i = 0; i < 3; i++) {
+      const yy = -s*0.2 + i * s*0.2;
+      cctx.moveTo(-s*0.25, yy);
+      cctx.lineTo(s*0.25, yy);
+    }
+    cctx.stroke();
+    cctx.restore();
+  }
+
+  function placeChips(cctx) {
+    const target = IS_MOBILE ? 8 : 12;
+    const minDim = Math.min(W, H);
+    const excludeR = minDim * 0.22;
+    const heartR = heartDrawSize * 0.55;
+
+    chipsList.length = 0;
+    let attempts = 0;
+    while (chipsList.length < target && attempts < 600) {
+      attempts++;
+      const size = 45 + Math.random() * 55;
+      const r = size * 0.85 + 12;
+      const x0 = 40 + Math.random() * Math.max(1, W - 80);
+      const y0 = 40 + Math.random() * Math.max(1, H - 80);
+      if (Math.hypot(x0 - W/2, y0 - H/2) < excludeR + r) continue;
+      let ok = true;
+      for (const c of chipsList) {
+        const cr = c.size * 0.85 + 12;
+        if (Math.hypot(x0 - c.x0, y0 - c.y0) < r + cr) { ok = false; break; }
+      }
+      if (!ok) continue;
+      const chip = {
+        x0, y0, size,
+        rot: (Math.random() - 0.5) * 0.4,
+        pins: 4 + Math.floor(Math.random() * 6),
+        hue: 190 + Math.random() * 40,
+        alpha: 0.12 + Math.random() * 0.06,
+      };
+      chipsList.push(chip);
+      renderChip(chip, cctx);
+    }
+
+    for (const chip of chipsList) {
+      const nTraces = 2 + Math.floor(Math.random() * 3);
+      for (let k = 0; k < nTraces; k++) {
+        const ang = Math.random() * Math.PI * 2;
+        const len1 = 50 + Math.random() * 120;
+        const len2 = 30 + Math.random() * 90;
+        const ang2 = ang + (Math.random() - 0.5) * 0.7;
+
+        const x1 = chip.x0 + Math.cos(ang) * chip.size / 2;
+        const y1 = chip.y0 + Math.sin(ang) * chip.size / 2;
+        const x2 = x1 + Math.cos(ang) * len1;
+        const y2 = y1 + Math.sin(ang) * len1;
+        const x3 = x2 + Math.cos(ang2) * len2;
+        const y3 = y2 + Math.sin(ang2) * len2;
+
+        const inHeart = (px, py) => Math.hypot(px - W/2, py - H/2) < heartR;
+        if (inHeart(x2, y2) || inHeart(x3, y3)) continue;
+        if (x3 < 10 || x3 > W - 10 || y3 < 10 || y3 > H - 10) continue;
+
+        cctx.strokeStyle = `hsla(${chip.hue}, 100%, 60%, 0.10)`;
+        cctx.lineWidth = 0.8;
+        cctx.beginPath();
+        cctx.moveTo(x1, y1);
+        cctx.lineTo(x2, y2);
+        cctx.lineTo(x3, y3);
+        cctx.stroke();
+
+        cctx.fillStyle = `hsla(${chip.hue}, 100%, 70%, 0.18)`;
+        cctx.beginPath();
+        cctx.arc(x3, y3, 2, 0, Math.PI * 2);
+        cctx.fill();
+      }
+    }
+
+    for (let i = 0; i < 60; i++) {
+      const x = Math.random() * W;
+      const y = Math.random() * H;
+      const r = 0.3 + Math.random() * 1.1;
+      cctx.fillStyle = `rgba(120,220,255,${0.08 + Math.random() * 0.22})`;
+      cctx.beginPath();
+      cctx.arc(x, y, r, 0, Math.PI * 2);
+      cctx.fill();
+    }
+  }
+
+  function buildBackground() {
+    backgroundLayer = document.createElement('canvas');
+    backgroundLayer.width = scene.width;
+    backgroundLayer.height = scene.height;
+    const bctx = backgroundLayer.getContext('2d');
+    bctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    const g = bctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, Math.max(W, H) * 0.75);
+    g.addColorStop(0, '#0a1628');
+    g.addColorStop(0.55, '#05070f');
+    g.addColorStop(1, '#000');
+    bctx.fillStyle = g;
+    bctx.fillRect(0, 0, W, H);
+
+    bctx.strokeStyle = 'rgba(40,180,255,0.055)';
+    bctx.lineWidth = 1;
+    bctx.beginPath();
+    const grid = 60;
+    for (let x = 0; x <= W; x += grid) { bctx.moveTo(x, 0); bctx.lineTo(x, H); }
+    for (let y = 0; y <= H; y += grid) { bctx.moveTo(0, y); bctx.lineTo(W, y); }
+    bctx.stroke();
+
+    placeChips(bctx);
+  }
+
+  // ---------- Сердце: прежний чистый вид ----------
+  function buildHeart() {
+    const minDim = Math.min(W, H);
+    const baseSize = minDim * 0.42;
+    heartDrawSize = baseSize;
+    const canvasSize = baseSize * 2.4;
+    const canvasPx = Math.ceil(canvasSize * DPR);
+
+    heartLayer = document.createElement('canvas');
+    heartLayer.width = canvasPx;
+    heartLayer.height = canvasPx;
+    const hc = heartLayer.getContext('2d');
+    hc.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    const c = canvasSize / 2;
+    const scale = baseSize / 32;
+
+    hc.translate(c, c);
+    hc.scale(scale, scale);
+    hc.translate(0, -2.7);
+
+    // Внешнее свечение
+    const glow = hc.createRadialGradient(0, 0, 0, 0, 0, 32);
+    glow.addColorStop(0, 'rgba(255,40,100,0.42)');
+    glow.addColorStop(0.5, 'rgba(255,20,120,0.12)');
+    glow.addColorStop(1, 'rgba(255,20,120,0)');
+    hc.fillStyle = glow;
+    hc.beginPath();
+    hc.arc(0, 0, 32, 0, Math.PI * 2);
+    hc.fill();
+
+    // Контур
+    hc.beginPath();
+    const steps = 140;
+    for (let i = 0; i <= steps; i++) {
+      const a = (i / steps) * Math.PI * 2;
+      const p = heartPoint(a);
+      if (i === 0) hc.moveTo(p.x, p.y);
+      else hc.lineTo(p.x, p.y);
+    }
+    hc.closePath();
+
+    // Заливка
+    const hg = hc.createLinearGradient(0, -18, 0, 16);
+    hg.addColorStop(0, 'rgba(255,90,140,0.55)');
+    hg.addColorStop(0.5, 'rgba(255,25,90,0.48)');
+    hg.addColorStop(1, 'rgba(180,0,80,0.6)');
+    hc.fillStyle = hg;
+    hc.fill();
+
+    // Неоновый контур
+    hc.shadowBlur = 25;
+    hc.shadowColor = '#ff2d6f';
+    hc.strokeStyle = 'rgba(255,100,150,1)';
+    hc.lineWidth = 1.8;
+    hc.stroke();
+
+    // Тонкий блик
+    hc.shadowBlur = 0;
+    hc.strokeStyle = 'rgba(255,210,225,0.3)';
+    hc.lineWidth = 0.6;
+    hc.stroke();
+
+    heartLayer._canvasSize = canvasSize;
+  }
+
+  function resize() {
+    const maxDpr = IS_MOBILE ? 1.25 : 1.5;
+    DPR = Math.min(window.devicePixelRatio || 1, maxDpr);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    scene.width = Math.round(W * DPR);
+    scene.height = Math.round(H * DPR);
+    scene.style.width = W + 'px';
+    scene.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    if (particleSprites.length === 0) buildParticleSprites();
+    buildHeart();
+    buildBackground();
+
+    if (!plane.initialized) {
+      plane.x = W * 0.8;
+      plane.y = H * 0.2;
+      plane.angle = Math.PI * 0.75;
+      plane.initialized = true;
+      pickNewTarget();
+    } else {
+      plane.x = Math.max(30, Math.min(W - 30, plane.x || W/2));
+      plane.y = Math.max(30, Math.min(H - 30, plane.y || H/2));
+      if (!isFinite(plane.angle)) plane.angle = 0;
+      plane.waypoints = [];
+      orbitPhase = 'none';
+      pickNewTarget();
+    }
+  }
+
+  function spawnFirework(x, y, hue, count) {
+    count = count || (28 + Math.floor(Math.random() * 20));
+    for (let i = 0; i < count; i++) {
+      const a = (i / count) * Math.PI * 2 + Math.random() * 0.3;
+      const sp = 1.5 + Math.random() * 3;
+      sparks.push({
+        x, y,
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp,
+        life: 1,
+        decay: 0.012 + Math.random() * 0.012,
+        hue: hue + (Math.random() - 0.5) * 50,
+        size: 1 + Math.random() * 1.8,
+      });
+    }
+  }
+
+  function pickNewTarget() {
+    const margin = Math.max(30, Math.min(70, Math.min(W, H) * 0.12));
+    const cx = W / 2, cy = H / 2;
+    const heartR = heartDrawSize * 0.42;
+    const minDist = Math.min(180, Math.min(W, H) * 0.35);
+
+    let fx, fy, tries = 0;
+    do {
+      fx = margin + Math.random() * Math.max(1, W - margin * 2);
+      fy = margin + Math.random() * Math.max(1, H - margin * 2);
+      tries++;
+    } while (Math.hypot(fx - plane.x, fy - plane.y) < minDist && tries < 12);
+
+    if (Math.hypot(fx - plane.x, fy - plane.y) < minDist) {
+      const corners = [
+        { x: margin, y: margin },
+        { x: W - margin, y: margin },
+        { x: margin, y: H - margin },
+        { x: W - margin, y: H - margin },
+      ];
+      let best = corners[0], bestD = -1;
+      for (const c of corners) {
+        const d = Math.hypot(c.x - plane.x, c.y - plane.y);
+        if (d > bestD) { bestD = d; best = c; }
+      }
+      fx = best.x; fy = best.y;
+    }
+
+    plane.waypoints = [];
+
+    if (Math.random() < 0.30) {
+      const wpX = cx + (Math.random() - 0.5) * heartR * 0.9;
+      const wpY = cy + (Math.random() - 0.5) * heartR * 0.9;
+      if (Math.hypot(wpX - plane.x, wpY - plane.y) > 90) {
+        plane.waypoints.push({ x: wpX, y: wpY });
+      }
+    }
+
+    plane.waypoints.push({ x: fx, y: fy });
+    plane.chaseTime = 0;
+  }
+
+  function drawPlaneShape() {
+    const fill = 'rgba(220,248,255,0.96)';
+    const stroke = '#7ff4ff';
+    ctx.fillStyle = fill;
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 0.7;
+    ctx.lineJoin = 'round';
+
+    for (const sgn of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(8, sgn * 2);
+      ctx.lineTo(0, sgn * 16);
+      ctx.lineTo(-5, sgn * 16.5);
+      ctx.lineTo(-1, sgn * 2);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.ellipse(3.5, sgn * 6, 3.5, 1.8, sgn * 0.15, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = 'rgba(40,120,160,0.9)';
+      ctx.beginPath();
+      ctx.arc(5.6, sgn * 6, 1.1, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = fill;
+
+      ctx.beginPath();
+      ctx.moveTo(-14, sgn * 1.5);
+      ctx.lineTo(-17, sgn * 6);
+      ctx.lineTo(-21, sgn * 6);
+      ctx.lineTo(-21, sgn * 1.5);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(22, 0);
+    ctx.bezierCurveTo(20, -2, 16, -3, 10, -3.2);
+    ctx.lineTo(-16, -2.4);
+    ctx.lineTo(-19, -2.2);
+    ctx.lineTo(-22, -1.5);
+    ctx.lineTo(-22, 1.5);
+    ctx.lineTo(-19, 2.2);
+    ctx.lineTo(-16, 2.4);
+    ctx.lineTo(10, 3.2);
+    ctx.bezierCurveTo(16, 3, 20, 2, 22, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(20,60,90,0.9)';
+    ctx.beginPath();
+    ctx.ellipse(15.5, 0, 2.2, 1, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = 'rgba(80,200,240,0.5)';
+    for (let i = -14; i <= 11; i += 2) {
+      ctx.beginPath();
+      ctx.arc(i, 0, 0.3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.strokeStyle = 'rgba(255,80,140,0.9)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(-17, -2.2); ctx.lineTo(-17, 2.2);
+    ctx.moveTo(-20, -1.8); ctx.lineTo(-20, 1.8);
+    ctx.stroke();
+  }
+
+  function updatePlane(dt) {
+    if (!isFinite(plane.x) || !isFinite(plane.y) || !isFinite(plane.angle)) {
+      plane.x = W * 0.8;
+      plane.y = H * 0.2;
+      plane.angle = 0;
+      plane.waypoints = [];
+      orbitPhase = 'none';
+    }
+
+    if (plane.boost > 0) plane.boost = Math.max(0, plane.boost - dt / 1.5);
+
+    // TRANSITION: плавный заход на старт орбиты
+    if (orbitPhase === 'transition') {
+      const progress = Math.min(1, (t - orbitTransStartTime) / ORBIT_TRANS_DURATION);
+      const ease = progress * progress * (3 - 2 * progress);
+
+      const innerScale = (heartDrawSize / 32) * 0.68;
+      const targetP = heartPoint(orbitTransTargetAngle);
+      const targetX = W/2 + targetP.x * innerScale;
+      const targetY = H/2 + (targetP.y - 2.7) * innerScale;
+
+      plane.x = orbitTransStartX + (targetX - orbitTransStartX) * ease;
+      plane.y = orbitTransStartY + (targetY - orbitTransStartY) * ease;
+
+      const p2 = heartPoint(orbitTransTargetAngle + 0.06);
+      const tdx = (p2.x - targetP.x) * innerScale;
+      const tdy = (p2.y - targetP.y) * innerScale;
+      const targetAngle = Math.atan2(tdy, tdx);
+
+      let adiff = targetAngle - orbitTransStartAngle;
+      while (adiff > Math.PI) adiff -= Math.PI * 2;
+      while (adiff < -Math.PI) adiff += Math.PI * 2;
+      plane.angle = orbitTransStartAngle + adiff * ease;
+
+      if (progress >= 1) {
+        orbitStartTime = t;
+        orbitStartAngle = orbitTransTargetAngle;
+        orbitPhase = 'orbit';
+        plane.trail.length = 0;
+      }
+
+    // ORBIT: круг по контуру
+    } else if (orbitPhase === 'orbit') {
+      const elapsed = t - orbitStartTime;
+      const duration = 4.0;
+      if (elapsed >= duration) {
+        orbitPhase = 'none';
+        plane.trail.length = 0;
+        pickNewTarget();
+      } else {
+        const progress = elapsed / duration;
+        const ang = orbitStartAngle + progress * Math.PI * 2;
+        const p1 = heartPoint(ang);
+        const p2 = heartPoint(ang + 0.06);
+        const innerScale = (heartDrawSize / 32) * 0.68;
+        plane.x = W/2 + p1.x * innerScale;
+        plane.y = H/2 + (p1.y - 2.7) * innerScale;
+        const ddx = (p2.x - p1.x) * innerScale;
+        const ddy = (p2.y - p1.y) * innerScale;
+        plane.angle = Math.atan2(ddy, ddx);
+      }
+
+    // APPROACH + NORMAL
+    } else {
+      let shouldFly = true;
+
+      if (orbitPhase === 'approach') {
+        const dHeart = Math.hypot(plane.x - W/2, plane.y - H/2);
+        if (dHeart < heartDrawSize * 0.55) {
+          const innerScale = (heartDrawSize / 32) * 0.68;
+          const px = (plane.x - W/2) / innerScale;
+          const py = (plane.y - H/2) / innerScale + 2.7;
+          let bestAngle = 0, bestDist = Infinity;
+          for (let i = 0; i < 128; i++) {
+            const a = (i / 128) * Math.PI * 2;
+            const hp = heartPoint(a);
+            const d = Math.hypot(hp.x - px, hp.y - py);
+            if (d < bestDist) { bestDist = d; bestAngle = a; }
+          }
+
+          orbitTransStartTime = t;
+          orbitTransStartX = plane.x;
+          orbitTransStartY = plane.y;
+          orbitTransStartAngle = plane.angle;
+          orbitTransTargetAngle = bestAngle;
+          orbitPhase = 'transition';
+          plane.trail.length = 0;
+          heartPulse = 1;
+          spawnFirework(W/2, H/2, 330, 30);
+          showToast('♥ ОРБИТА', '#ff5a9a');
+          shouldFly = false;
+        }
+      }
+
+      if (shouldFly) {
+        if (plane.waypoints.length === 0) pickNewTarget();
+
+        const target = plane.waypoints[0];
+        if (!target || !isFinite(target.x) || !isFinite(target.y)) {
+          plane.waypoints = [];
+          pickNewTarget();
+        } else {
+          const dx = target.x - plane.x;
+          const dy = target.y - plane.y;
+          const dist = Math.hypot(dx, dy);
+          const reachRadius = plane.boost > 0.1 ? 70 : 50;
+
+          if (dist < reachRadius || plane.chaseTime > 12 || !isFinite(dist)) {
+            plane.waypoints.shift();
+            plane.chaseTime = 0;
+            if (plane.waypoints.length === 0) pickNewTarget();
+          } else {
+            plane.chaseTime += dt;
+
+            const desiredAngle = Math.atan2(dy, dx);
+            let diff = desiredAngle - plane.angle;
+            while (diff > Math.PI) diff -= Math.PI * 2;
+            while (diff < -Math.PI) diff += Math.PI * 2;
+            const maxTurn = 4.5 * dt;
+            if (Math.abs(diff) < 0.01) {
+              plane.angle = desiredAngle;
+            } else if (Math.abs(diff) <= maxTurn) {
+              plane.angle = desiredAngle;
+            } else {
+              plane.angle += Math.sign(diff) * maxTurn;
+            }
+
+            const speed = 200 + plane.boost * 480;
+            plane.x += Math.cos(plane.angle) * speed * dt;
+            plane.y += Math.sin(plane.angle) * speed * dt;
+
+            if (plane.x < -40 || plane.x > W + 40 || plane.y < -40 || plane.y > H + 40) {
+              plane.x = Math.max(30, Math.min(W - 30, plane.x));
+              plane.y = Math.max(30, Math.min(H - 30, plane.y));
+              pickNewTarget();
+            }
+          }
+        }
+      }
+    }
+
+    // Трейл
+    const last = plane.trail.length > 0 ? plane.trail[plane.trail.length - 1] : null;
+    if (last) {
+      const tdx = plane.x - last.x, tdy = plane.y - last.y;
+      const td = Math.hypot(tdx, tdy);
+      if (td > 10) {
+        const steps = Math.min(Math.floor(td / 8), 6);
+        for (let i = 1; i <= steps; i++) {
+          plane.trail.push({
+            x: last.x + tdx * i / (steps + 1),
+            y: last.y + tdy * i / (steps + 1),
+            life: 1,
+          });
+        }
+      }
+    }
+    plane.trail.push({ x: plane.x, y: plane.y, life: 1 });
+    const maxTrail = plane.boost > 0.1 ? 90 : 55;
+    while (plane.trail.length > maxTrail) plane.trail.shift();
+    for (let i = 0; i < plane.trail.length; i++) {
+      plane.trail[i].life -= 0.018;
+    }
+
+    if (plane.boost > 0.1 && (orbitPhase === 'none' || orbitPhase === 'approach')) {
+      const backX = plane.x - Math.cos(plane.angle) * 22;
+      const backY = plane.y - Math.sin(plane.angle) * 22;
+      for (let i = 0; i < 2; i++) {
+        const sa = plane.angle + Math.PI + (Math.random() - 0.5) * 0.5;
+        const sp = 1 + Math.random() * 2;
+        sparks.push({
+          x: backX + (Math.random() - 0.5) * 6,
+          y: backY + (Math.random() - 0.5) * 6,
+          vx: Math.cos(sa) * sp,
+          vy: Math.sin(sa) * sp,
+          life: 0.7, decay: 0.025,
+          hue: 190, size: 1 + Math.random() * 1.2,
+        });
+      }
+    }
+  }
+
+  function renderPlane() {
+    for (let i = 0; i < plane.trail.length; i++) {
+      const p = plane.trail[i];
+      if (p.life <= 0) continue;
+      const alpha = p.life * 0.5 * (i / plane.trail.length);
+      ctx.fillStyle = `rgba(120,240,255,${alpha})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 1 + p.life * 1.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.save();
+    ctx.translate(plane.x, plane.y);
+    ctx.rotate(plane.angle);
+    ctx.scale(1.3, 1.3);
+    drawPlaneShape();
+    ctx.restore();
+  }
+
+  function renderHeart(dt) {
+    const cx = W / 2, cy = H / 2;
+    if (heartPulse > 0) heartPulse = Math.max(0, heartPulse - dt * 1.5);
+    const pulse = 1 + 0.05 * Math.sin(t * 2.2) + 0.02 * Math.sin(t * 5.1) + heartPulse * 0.14;
+    const drawSize = heartLayer._canvasSize * pulse;
+    ctx.drawImage(heartLayer, cx - drawSize / 2, cy - drawSize / 2, drawSize, drawSize);
+  }
+
+  function renderChipPulses() {
+    if (chipPulses.size === 0) return;
+    for (const [chip, hitTime] of chipPulses) {
+      const elapsed = t - hitTime;
+      if (elapsed > 1.5) { chipPulses.delete(chip); continue; }
+      const a = 1 - elapsed / 1.5;
+      ctx.save();
+      ctx.translate(chip.x0, chip.y0);
+      ctx.rotate(chip.rot);
+      ctx.strokeStyle = `hsla(${chip.hue}, 100%, 65%, ${a * 0.35})`;
+      ctx.lineWidth = 8;
+      ctx.strokeRect(-chip.size/2, -chip.size/2, chip.size, chip.size);
+      ctx.strokeStyle = `hsla(${chip.hue}, 100%, 85%, ${a})`;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(-chip.size/2, -chip.size/2, chip.size, chip.size);
+      ctx.restore();
+    }
+  }
+
+  function isHeartClick(mx, my) {
+    return Math.hypot(mx - W/2, my - H/2) < heartDrawSize * 0.45;
+  }
+  function isPlaneClick(mx, my) {
+    return Math.hypot(mx - plane.x, my - plane.y) < 32;
+  }
+  function chipAt(mx, my) {
+    for (const c of chipsList) {
+      if (Math.hypot(mx - c.x0, my - c.y0) < c.size * 0.6) return c;
+    }
+    return null;
+  }
+
+  function sendPlaneTo(x, y) {
+    if (orbitPhase === 'orbit' || orbitPhase === 'transition') return;
+    orbitPhase = 'none';
+    plane.waypoints = [{ x, y }];
+    plane.chaseTime = 0;
+  }
+
+  function triggerHeartFlight() {
+    if (orbitPhase !== 'none') return;
+    orbitPhase = 'approach';
+    plane.waypoints = [{ x: W/2, y: H/2 }];
+    plane.chaseTime = 0;
+    showToast('♥ КУРС НА СЕРДЦЕ', '#ff5a9a');
+  }
+
+  function triggerPlaneBoost() {
+    plane.boost = 1;
+    showToast('✈ УСКОРЕНИЕ', '#7ff4ff');
+  }
+
+  function triggerChip(chip) {
+    chipPulses.set(chip, t);
+    spawnFirework(chip.x0, chip.y0, chip.hue, 16);
+    showToast('⚡ ПИТАНИЕ ПОДАНО', `hsl(${chip.hue}, 100%, 70%)`);
+  }
+
+  function handleTap(mx, my) {
+    if (orbitPhase === 'none' && isPlaneClick(mx, my)) {
+      triggerPlaneBoost();
+      return;
+    }
+    const chip = chipAt(mx, my);
+    if (chip) {
+      triggerChip(chip);
+      sendPlaneTo(chip.x0, chip.y0);
+      return;
+    }
+    if (isHeartClick(mx, my)) {
+      triggerHeartFlight();
+      return;
+    }
+    spawnFirework(mx, my, 190 + Math.random() * 120);
+    sendPlaneTo(mx, my);
+  }
+
+  scene.addEventListener('click', (e) => handleTap(e.clientX, e.clientY));
+  scene.addEventListener('mousemove', (e) => {
+    if (IS_MOBILE) return;
+    const mx = e.clientX, my = e.clientY;
+    const hit = isPlaneClick(mx, my) || isHeartClick(mx, my) || chipAt(mx, my);
+    scene.style.cursor = hit ? 'pointer' : 'default';
+  });
+  scene.addEventListener('touchstart', (e) => {
+    const tt = e.touches[0];
+    if (tt) handleTap(tt.clientX, tt.clientY);
+  }, { passive: true });
+
+  function loop(now) {
+    if (!lastTime) lastTime = now;
+    const dt = Math.min((now - lastTime) / 1000, 0.05);
+    lastTime = now;
+    t += dt;
+
+    if (orbitPhase === 'orbit') statusEl.textContent = 'ОРБИТА';
+    else if (orbitPhase === 'transition') statusEl.textContent = 'ЗАХОД';
+    else if (orbitPhase === 'approach') statusEl.textContent = 'К СЕРДЦУ';
+    else if (plane.boost > 0.1) statusEl.textContent = 'УСКОРЕНИЕ';
+    else if (statusResetTimer > 0) {
+      statusResetTimer -= dt;
+      if (statusResetTimer <= 0) statusEl.textContent = 'ОНЛАЙН';
+    }
+    if (orbitPhase !== 'none' || plane.boost > 0.1) statusResetTimer = 1.2;
+
+    ctx.drawImage(backgroundLayer, 0, 0, W, H);
+    renderHeart(dt);
+    renderChipPulses();
+    updatePlane(dt);
+    renderPlane();
+
+    fwTimer -= dt;
+    if (fwTimer <= 0) {
+      fwTimer = 1.2 + Math.random() * 1.4;
+      const ang = Math.random() * Math.PI * 2;
+      const r = Math.min(W, H) * (0.38 + Math.random() * 0.22);
+      spawnFirework(W/2 + Math.cos(ang) * r, H/2 + Math.sin(ang) * r * 0.8, 190 + Math.random() * 120);
+    }
+
+    if (sparks.length > 0) {
+      ctx.globalCompositeOperation = 'lighter';
+      for (let i = sparks.length - 1; i >= 0; i--) {
+        const p = sparks[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vx *= 0.985;
+        p.vy *= 0.985;
+        p.vy += 0.02;
+        p.life -= p.decay;
+        if (p.life <= 0) { sparks.splice(i, 1); continue; }
+        const sp = spriteForHue(p.hue);
+        const ds = p.size * p.life * 10 + 4;
+        ctx.globalAlpha = p.life;
+        ctx.drawImage(sp, p.x - ds/2, p.y - ds/2, ds, ds);
+      }
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  let resizeTimer;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resize, 150);
+  });
+
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
